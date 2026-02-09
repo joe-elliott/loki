@@ -17,39 +17,53 @@ import (
 // New creates a new Symbolizer with the given initial capacity and maximum size.
 func New(initialCapacity int, maxSize int) *Symbolizer {
 	return &Symbolizer{
-		symbols: make(map[string]string, initialCapacity),
-		maxSize: maxSize,
+		symbols:   make(map[string]string, initialCapacity),
+		maxSize:   maxSize,
+		fifoQueue: make([]string, 0, maxSize/10), // Pre-allocate for eviction tracking
 	}
 }
 
 type Symbolizer struct {
-	symbols map[string]string
-	maxSize int
+	symbols   map[string]string
+	maxSize   int
+	fifoQueue []string // Tracks insertion order for FIFO eviction
 }
 
 // Get returns a string from the symbolizer. If the string is not in the cache,
 // a clone is inserted into the cache and returned.
 //
 // Get may delete some values from the cache prior to inserting a new value if
-// the maximum size is exceeded.
+// the maximum size is exceeded. Eviction uses a FIFO strategy for better
+// predictability and cache efficiency.
 func (s *Symbolizer) Get(name string) string {
 	if value, ok := s.symbols[name]; ok {
 		return value
 	}
-	// Control maximum memory use by discarding a random 1% of symbols if the map gets too big.
-	// We rely on Golang's unspecified map ordering to choose what to discard.
+
+	// Control maximum memory use by discarding oldest 1% of symbols using FIFO when map gets too big.
+	// This provides better cache coherency than random eviction.
 	if len(s.symbols) > s.maxSize {
-		i := 0
-		for k := range s.symbols {
-			if i > s.maxSize/100 {
-				break
+		evictCount := max(1, s.maxSize/100)
+		// If queue is smaller than evict count, fall back to clearing entire queue
+		if len(s.fifoQueue) < evictCount {
+			for _, k := range s.fifoQueue {
+				delete(s.symbols, k)
 			}
-			delete(s.symbols, k)
-			i++
+			s.fifoQueue = s.fifoQueue[:0]
+		} else {
+			// Evict oldest entries
+			for i := 0; i < evictCount; i++ {
+				delete(s.symbols, s.fifoQueue[i])
+			}
+			// Shift queue to remove evicted entries
+			copy(s.fifoQueue, s.fifoQueue[evictCount:])
+			s.fifoQueue = s.fifoQueue[:len(s.fifoQueue)-evictCount]
 		}
 	}
+
 	newString := strings.Clone(name)
 	s.symbols[newString] = newString
+	s.fifoQueue = append(s.fifoQueue, newString)
 	return newString
 }
 
@@ -57,4 +71,5 @@ func (s *Symbolizer) Get(name string) string {
 // maintaining the existing maxSize.
 func (s *Symbolizer) Reset() {
 	clear(s.symbols)
+	s.fifoQueue = s.fifoQueue[:0]
 }

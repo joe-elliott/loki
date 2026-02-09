@@ -141,9 +141,14 @@ func (pr *basicRowReader) fill(ctx context.Context, columns []Column, s []Row) (
 	startRow := int64(s[0].Index)
 
 	// Ensure that each Row.Values slice has enough capacity to store all values.
+	// Optimization: Only grow slices that don't have sufficient capacity to avoid
+	// unnecessary capacity checks and allocations.
+	requiredCap := len(pr.columns)
 	for i := range s {
-		s[i].Values = slicegrow.GrowToCap(s[i].Values, len(pr.columns))
-		s[i].Values = s[i].Values[:len(pr.columns)]
+		if cap(s[i].Values) < requiredCap {
+			s[i].Values = slicegrow.GrowToCap(s[i].Values, requiredCap)
+		}
+		s[i].Values = s[i].Values[:requiredCap]
 	}
 
 	for n < len(s) {
