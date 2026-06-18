@@ -83,7 +83,6 @@ func TestCoordinator_EndToEnd(t *testing.T) {
 			ToCConsolidateTimeout:     10 * time.Second,
 			MaxRunningCompactionTasks: 4,
 			PlanVersion:               1,
-			Scheduler:                 SchedulerConfig{Endpoint: defaultEndpoint},
 		},
 		logger: log.NewNopLogger(),
 		bucket: bucket,
