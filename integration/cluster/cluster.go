@@ -112,6 +112,14 @@ analytics:
 ingester:
   lifecycler:
     min_ready_duration: 0s
+  wal:
+    # Disable the WAL disk-full write throttle for the in-process test cluster so
+    # the integration harness is independent of the host's disk usage. The
+    # default 0.90 threshold otherwise causes the ingester to reject every push
+    # (HTTP 500 "Ingester is shutting down") on machines whose filesystem reports
+    # above it -- e.g. macOS APFS, which reports the shared container near-full --
+    # which would break every ingesting integration test.
+    disk_full_threshold: 0
 
 querier:
   multi_tenant_queries_enabled: true
@@ -140,6 +148,23 @@ func resetMetricRegistry() {
 	registry := &wrappedRegisterer{Registry: prometheus.NewRegistry()}
 	prometheus.DefaultRegisterer = registry
 	prometheus.DefaultGatherer = registry
+}
+
+// resetGlobalDefaultLimits restores the process-global default limits (used by
+// validation.Limits.UnmarshalYAML as the base for both config-file and
+// per-tenant-override parsing) to their pristine flag defaults.
+//
+// Loki keeps these defaults in a package global that every component sets on
+// init. Because the integration suite runs many in-process clusters in a single
+// test binary, a test that configures a restrictive limit (e.g. a small
+// max_query_length) would otherwise leak that value: it becomes the parse base
+// for every cluster created afterwards, whose own config does not re-specify the
+// limit and so silently inherits the restrictive value. Resetting on every
+// cluster.New keeps each cluster's limits hermetic regardless of test order.
+func resetGlobalDefaultLimits() {
+	var limits validation.Limits
+	limits.RegisterFlags(flag.NewFlagSet("reset-default-limits", flag.PanicOnError))
+	validation.SetDefaultLimitsForYAMLUnmarshalling(limits)
 }
 
 type wrappedRegisterer struct {
@@ -181,6 +206,7 @@ func New(logLevel level.Value, opts ...func(*Cluster)) *Cluster {
 	}
 
 	resetMetricRegistry()
+	resetGlobalDefaultLimits()
 	sharedPath, err := os.MkdirTemp("", "loki-shared-data-")
 	if err != nil {
 		panic(err.Error())

@@ -581,7 +581,25 @@ func (c *Client) RunRangeQueryWithStartEnd(ctx context.Context, query string, st
 	ctx, cancelFunc := context.WithTimeout(ctx, requestTimeout)
 	defer cancelFunc()
 
-	buf, statusCode, err := c.run(ctx, c.rangeQueryURL(query, start, end), extraHeaders...)
+	buf, statusCode, err := c.run(ctx, c.rangeQueryURL(query, start, end, 0), extraHeaders...)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.parseResponse(buf, statusCode)
+}
+
+// RunRangeQueryWithLimit runs a 7d range query with an explicit `limit` query
+// parameter (the maximum number of log entries to return). A limit <= 0 leaves
+// the parameter unset, deferring to the server default.
+func (c *Client) RunRangeQueryWithLimit(ctx context.Context, query string, limit int, extraHeaders ...Header) (*Response, error) {
+	ctx, cancelFunc := context.WithTimeout(ctx, requestTimeout)
+	defer cancelFunc()
+
+	end := c.Now.Add(time.Second)
+	start := c.Now.Add(-7 * 24 * time.Hour)
+
+	buf, statusCode, err := c.run(ctx, c.rangeQueryURL(query, start, end, limit), extraHeaders...)
 	if err != nil {
 		return nil, err
 	}
@@ -652,11 +670,14 @@ func (c *Client) parseResponse(buf []byte, statusCode int) (*Response, error) {
 	return &lokiResp, nil
 }
 
-func (c *Client) rangeQueryURL(query string, start, end time.Time) string {
+func (c *Client) rangeQueryURL(query string, start, end time.Time, limit int) string {
 	v := url.Values{}
 	v.Set("query", query)
 	v.Set("start", FormatTS(start))
 	v.Set("end", FormatTS(end))
+	if limit > 0 {
+		v.Set("limit", strconv.Itoa(limit))
+	}
 
 	u, err := url.Parse(c.baseURL)
 	if err != nil {
