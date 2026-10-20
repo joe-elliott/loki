@@ -4,118 +4,135 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/grafana/regexp"
+
 	"github.com/stretchr/testify/require"
 )
 
-func Test_SimplifiedRegex(t *testing.T) {
+func Test_RegexpFilter(t *testing.T) {
 	fixtures := []string{
 		"foo", "foobar", "bar", "foobuzz", "buzz", "f", "  ", "fba", "foofoofoo", "b", "foob", "bfoo", "FoO",
-		"foo, 世界", allunicode(), "fooÏbar",
+		"foo, 世界", allunicode(), "fooÏbar", "", "\n", "\n\n", "foo\nbar", "bar\nfoo", "fo\no", "ſoo", "\u212Aey",
 	}
 	for _, test := range []struct {
 		re string
-
-		// Simplified is true when the regex is converted to non-regex filters
-		// or when the regex is rewritten to be non-greedy
-		simplified bool
-
-		// Expected != nil when the regex is converted to non-regex filters
+		// expected is the filter that the regexp becomes. A nil expected means a regexpFilter.
 		expected Filterer
-		match    bool
 	}{
-		// regex we intend to support.
-		{"foo", true, newContainsFilter([]byte("foo"), false), true},
-		{"not", true, NewNotFilter(newContainsFilter([]byte("not"), false)), false},
-		{"(foo)", true, newContainsFilter([]byte("foo"), false), true},
-		{"(foo|ba)", true, newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("ba"), false)), true},
-		{"(foo|ba|ar)", true, newOrFilter(newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("ba"), false)), newContainsFilter([]byte("ar"), false)), true},
-		{"(foo|(ba|ar))", true, newOrFilter(newContainsFilter([]byte("foo"), false), newOrFilter(newContainsFilter([]byte("ba"), false), newContainsFilter([]byte("ar"), false))), true},
-		{"foo.*", true, newContainsFilter([]byte("foo"), false), true},
-		{".*foo", true, NewNotFilter(newContainsFilter([]byte("foo"), false)), false},
-		{".*foo.*", true, newContainsFilter([]byte("foo"), false), true},
-		{"(.*)(foo).*", true, newContainsFilter([]byte("foo"), false), true},
-		{"(foo.*|.*ba)", true, newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("ba"), false)), true},
-		{"(foo.*|.*bar.*)", true, NewNotFilter(newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("bar"), false))), false},
-		{".*foo.*|bar", true, NewNotFilter(newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("bar"), false))), false},
-		{".*foo|bar", true, NewNotFilter(newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("bar"), false))), false},
-		// This construct is similar to (...), but won't create a capture group.
-		{"(?:.*foo.*|bar)", true, newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("bar"), false)), true},
-		// named capture group
-		{"(?P<foo>.*foo.*|bar)", true, newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("bar"), false)), true},
-		// parsed as (?-s:.)*foo(?-s:.)*|b(?:ar|uzz)
-		{".*foo.*|bar|buzz", true, newOrFilter(newContainsFilter([]byte("foo"), false), newOrFilter(newContainsFilter([]byte("bar"), false), newContainsFilter([]byte("buzz"), false))), true},
-		// parsed as (?-s:.)*foo(?-s:.)*|bar|uzz
-		{".*foo.*|bar|uzz", true, newOrFilter(newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("bar"), false)), newContainsFilter([]byte("uzz"), false)), true},
-		// parsed as foo|b(?:ar|(?:)|uzz)|zz
-		{"foo|bar|b|buzz|zz", true, newOrFilter(newOrFilter(newContainsFilter([]byte("foo"), false), newOrFilter(newOrFilter(newContainsFilter([]byte("bar"), false), newContainsFilter([]byte("b"), false)), newContainsFilter([]byte("buzz"), false))), newContainsFilter([]byte("zz"), false)), true},
-		// parsed as f(?:(?:)|oo(?:(?:)|bar))
-		{"f|foo|foobar", true, newOrFilter(newContainsFilter([]byte("f"), false), newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("foobar"), false))), true},
-		// parsed as f(?:(?-s:.)*|oobar(?-s:.)*)|(?-s:.)*buzz
-		{"f.*|foobar.*|.*buzz", true, newOrFilter(newOrFilter(newContainsFilter([]byte("f"), false), newContainsFilter([]byte("foobar"), false)), newContainsFilter([]byte("buzz"), false)), true},
-		// parsed as ((f(?-s:.)*)|foobar(?-s:.)*)|(?-s:.)*buzz
-		{"((f.*)|foobar.*)|.*buzz", true, newOrFilter(newOrFilter(newContainsFilter([]byte("f"), false), newContainsFilter([]byte("foobar"), false)), newContainsFilter([]byte("buzz"), false)), true},
-		{".*", true, TrueFilter, true},
-		{".*|.*", true, TrueFilter, true},
-		{".*||||", true, TrueFilter, true},
-		{"", true, TrueFilter, true},
-		{"(?i)foo", true, newContainsFilter([]byte("foo"), true), true},
-		{"(?i)界", true, newContainsFilter([]byte("界"), true), true},
-		{"(?i)ïB", true, newContainsFilter([]byte("ïB"), true), true},
-		{"(?:)foo|fatal|exception", true, newOrFilter(newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("fatal"), false)), newContainsFilter([]byte("exception"), false)), true},
-		{"(?i)foo|fatal|exception", true, newOrFilter(newOrFilter(newContainsFilter([]byte("FOO"), true), newContainsFilter([]byte("FATAL"), true)), newContainsFilter([]byte("exception"), true)), true},
-		{"(?i)f|foo|foobar", true, newOrFilter(newContainsFilter([]byte("F"), true), newOrFilter(newContainsFilter([]byte("FOO"), true), newContainsFilter([]byte("FOOBAR"), true))), true},
-		{"(?i)f|fatal|e.*", true, newOrFilter(newOrFilter(newContainsFilter([]byte("F"), true), newContainsFilter([]byte("FATAL"), true)), newContainsFilter([]byte("E"), true)), true},
-		{"(?i).*foo.*", true, newContainsFilter([]byte("FOO"), true), true},
-		{".+", true, ExistsFilter, true},
-
-		// These regexes are rewritten to be non-greedy but no new
-		// filter is generated.
-		{"[a-z]+foo", true, nil, true},
-		{".+foo", true, nil, true},
-		{".*fo.*o", true, nil, true},
-		{`\d`, true, nil, true},
-		{`\sfoo`, true, nil, true},
-		{`foo?`, false, nil, true},
-		{`foo{1,2}bar{2,3}`, true, nil, true},
-		{`foo|\d*bar`, true, nil, true},
-		{`foo|fo{1,2}`, true, nil, true},
-		{`foo|fo\d*`, true, nil, true},
-		{`foo|fo\d+`, true, nil, true},
-		{`(\w\d+)`, true, nil, true},
-		{`.*f.*oo|fo{1,2}`, true, nil, true},
-		{"f|f(?i)oo", true, nil, true},
-		{".foo+", true, nil, true},
-		{"foo.*(bar|uzz)", true, nil, true},
-		{"foo(.*bar|uzz)", true, nil, true},
+		{"foo", newContainsFilter([]byte("foo"), false)},
+		{"(foo|ba)", newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("ba"), false))},
+		{".*foo.*", newContainsFilter([]byte("foo"), false)},
+		{"(?:.*foo.*|bar)", newOrFilter(newContainsFilter([]byte("foo"), false), newContainsFilter([]byte("bar"), false))},
+		{"f|foo|foobar", newOrFilter(newOrFilter(newContainsFilter([]byte("f"), false), newContainsFilter([]byte("foo"), false)), newContainsFilter([]byte("foobar"), false))},
+		{"status=(2.*|3.*)", newPrefixedContainsFilter("status=", []string{"status=2", "status=3"})},
+		{"level=(warn|error)", newPrefixedContainsFilter("level=", []string{"level=warn", "level=error"})},
+		{"foo(ab|cd)(ab|cd)", newPrefixedContainsFilter("foo", []string{"fooabab", "foocdab", "fooabcd", "foocdcd"})},
+		{"[a-z]+foo", nil},
+		{".*fo.*o", nil},
+		{"^foo", nil},
+		{"foo$", nil},
+		{"f.o", nil},
+		{"foo|f(?i)oo", nil},
+		{".*", TrueFilter},
+		{".*|.*", TrueFilter},
+		{".*||||", TrueFilter},
+		{"", TrueFilter},
+		{"(foo|.*)", TrueFilter},
+		{"foo|", TrueFilter},
+		{"x*", TrueFilter},
+		{".+", ExistsFilter},
+		{".*.+.*", ExistsFilter},
+		{"(?i)foo", newContainsFilter([]byte("foo"), true)},
+		{"(?i).*foo.*", newContainsFilter([]byte("foo"), true)},
+		{"(?i)界", newContainsFilter([]byte("界"), false)},
+		{"(?i)ïB", newContainsFilter([]byte("ÏB"), true)},
+		{"(?i)foo|fatal|exception", newOrFilter(newOrFilter(newContainsFilter([]byte("foo"), true), newContainsFilter([]byte("fatal"), true)), newContainsFilter([]byte("exception"), true))},
+		{"(?i)f|fatal|e.*", newOrFilter(newOrFilter(newContainsFilter([]byte("f"), true), newContainsFilter([]byte("fatal"), true)), newContainsFilter([]byte("e"), true))},
+		{"(?i)level=(warn|error)", newOrFilter(newContainsFilter([]byte("level=warn"), true), newContainsFilter([]byte("level=error"), true))},
+		{"(?i:level=)(warn|error)", nil},
+		{"(?i)foo.*bar", nil},
 	} {
 		t.Run(test.re, func(t *testing.T) {
-			d, err := newRegexpFilter(test.re, test.re, test.match)
-			require.NoError(t, err, "invalid regex")
+			want := regexp.MustCompile(test.re)
 
-			f, err := parseRegexpFilter(test.re, test.match, false)
+			f, err := parseRegexpFilter(test.re, true, false)
 			require.NoError(t, err)
-
-			// if we don't expect simplification then the filter should be the same as the default one.
-			if !test.simplified {
-				require.Equal(t, d, f)
-				return
-			}
-
-			// otherwise ensure we have different filter
-			require.NotEqual(t, f, d)
 			if test.expected != nil {
 				require.Equal(t, test.expected, f)
 			} else {
 				reFilter, ok := f.(regexpFilter)
-				require.True(t, ok)
+				require.True(t, ok, "got %T", f)
 				require.Equal(t, test.re, reFilter.String())
 			}
 
-			// tests all lines with both filter, they should have the same result.
+			notF, err := parseRegexpFilter(test.re, false, false)
+			require.NoError(t, err)
 			for _, line := range fixtures {
 				l := []byte(line)
-				require.Equal(t, d.Filter(l), f.Filter(l), "regexp %s failed line: %s re:%v simplified:%v", test.re, line, d.Filter(l), f.Filter(l))
+				require.Equal(t, want.Match(l), f.Filter(l), "regexp %q line %q", test.re, line)
+				require.Equal(t, !want.Match(l), notF.Filter(l), "negated regexp %q line %q", test.re, line)
 			}
+		})
+	}
+}
+
+// Test_RegexpFilterRegressions holds the regexps that the simplifier which the filters replaced got
+// wrong. See https://github.com/grafana/loki/issues/23892.
+func Test_RegexpFilterRegressions(t *testing.T) {
+	for _, test := range []struct {
+		re      string
+		isLabel bool
+		line    string
+		want    bool
+	}{
+		// An alternate that matches the empty string makes the search match every line.
+		{`(error|.*)`, false, "info: all good", true},
+		{`error|`, false, "info: all good", true},
+		{`(GET|POST|.*)`, false, "info: all good", true},
+		// Alternates that share a prefix.
+		{`status=(2.*|3.*)`, false, "status=200", true},
+		{`(error.*|errno.*)`, false, "error: disk full", true},
+		// Two alternations in sequence.
+		{`foo(ab|cd)(ab|cd)`, false, "fooab", false},
+		{`foo(ab|cd)(ab|cd)`, false, "fooabcd", true},
+		// Case-insensitivity that covers only part of the regexp.
+		{`(?i:level=)(warn|error)`, false, "level=ERROR", false},
+		{`(?i:level=)(warn|error)`, false, "LEVEL=error", true},
+		{`(?i:level=)(w.*|e.*)`, false, "level=warn", true},
+		// Unicode simple case folding.
+		{`(?i)kelvin`, false, "\u212Aelvin", true},
+		{`(?i)soo`, false, "ſoo", true},
+		{`(?i)xi`, false, "xİ", false},
+		// A . does not match a newline.
+		{`.+`, false, "\n", false},
+		{`foo.bar`, false, "foo\nbar", false},
+		{`foo.*bar`, false, "foo\nbar", false},
+		{`foo.*|bar`, false, "x\nfoo", true},
+		// Label filters match the whole value.
+		{`api|api-v2`, true, "api-gateway", false},
+		{`api|api-v2`, true, "api-v2", true},
+		{`err|error`, true, "xerr", false},
+		{`foo.*`, true, "xfoo", false},
+		{`.*foo`, true, "foox", false},
+		// .* stays a no-op on a label, so it matches a value with a newline too.
+		{`.*`, true, "foo\nbar", true},
+		{`.*`, true, "", true},
+		{`(?s).*`, true, "foo\nbar", true},
+		{`(?i)foo`, true, "xFOO", false},
+		{`(?i)foo`, true, "FOO", true},
+	} {
+		name := fmt.Sprintf("%s/%q", test.re, test.line)
+		if test.isLabel {
+			name = "label/" + name
+		}
+		t.Run(name, func(t *testing.T) {
+			f, err := parseRegexpFilter(test.re, true, test.isLabel)
+			require.NoError(t, err)
+			require.Equal(t, test.want, f.Filter([]byte(test.line)))
+
+			notF, err := parseRegexpFilter(test.re, false, test.isLabel)
+			require.NoError(t, err)
+			require.Equal(t, !test.want, notF.Filter([]byte(test.line)))
 		})
 	}
 }
@@ -196,10 +213,11 @@ var res bool
 func benchmarkRegex(b *testing.B, re, line string, match bool) {
 	var m bool
 	l := []byte(line)
-	d, err := newRegexpFilter(re, re, match)
+	reg, err := regexp.Compile(re)
 	if err != nil {
 		b.Fatal(err)
 	}
+	d := FiltererFunc(func(line []byte) bool { return reg.Match(line) == match })
 	s, err := parseRegexpFilter(re, match, false)
 	if err != nil {
 		b.Fatal(err)
@@ -362,25 +380,25 @@ var cases = []struct {
 	},
 }
 
-func Test_containsLower(t *testing.T) {
+func Test_containsFold(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			line := []byte(c.line)
 			substr := []byte(c.substr)
-			m := containsLower(line, substr)
+			m := containsFold(line, substr)
 			require.Equal(t, c.expected, m, "line: %s substr: %s", c.line, c.substr)
 		})
 	}
 }
 
-func BenchmarkContainsLower(b *testing.B) {
+func BenchmarkContainsFold(b *testing.B) {
 	var m bool
 	for _, c := range cases {
 		b.Run(c.name, func(b *testing.B) {
 			line := []byte(c.line)
 			substr := []byte(c.substr)
 			for i := 0; i < b.N; i++ {
-				m = containsLower(line, substr)
+				m = containsFold(line, substr)
 			}
 			if m != c.expected {
 				b.Fatalf("expected %v but got %v", c.expected, m)

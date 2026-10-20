@@ -489,7 +489,7 @@ func TestLineFilterLabelFilter_String(t *testing.T) {
 			name: "it correctly surrounds regex containing backticks with double quotes",
 			fields: fields{
 				Matcher: labels.MustNewMatcher(labels.MatchRegexp, "msg", "`.`"),
-				Filter:  mustFilter(newRegexpFilter("`.`", "`.`", true)),
+				Filter:  mustFilter(newRegexpFilter("`.`", "^(?:`.`)$", "`.`")),
 			},
 			want: "msg=~\"`.`\"",
 		},
@@ -497,7 +497,7 @@ func TestLineFilterLabelFilter_String(t *testing.T) {
 			name: "it correctly surrounds regex containing double quote with backticks",
 			fields: fields{
 				Matcher: labels.MustNewMatcher(labels.MatchRegexp, "msg", `"`),
-				Filter:  mustFilter(newRegexpFilter(`"`, `"`, true)),
+				Filter:  mustFilter(newRegexpFilter(`"`, `^(?:")$`, `"`)),
 			},
 			want: "msg=~`\"`",
 		},
@@ -505,7 +505,7 @@ func TestLineFilterLabelFilter_String(t *testing.T) {
 			name: "it correctly surrounds regex containing both backticks and double quotes with double quotes",
 			fields: fields{
 				Matcher: labels.MustNewMatcher(labels.MatchRegexp, "msg", "`\""),
-				Filter:  mustFilter(newRegexpFilter("`\"", "`\"", true)),
+				Filter:  mustFilter(newRegexpFilter("`\"", "^(?:`\")$", "`\"")),
 			},
 			want: "msg=~\"`\\\"\"",
 		},
