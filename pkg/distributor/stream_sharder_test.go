@@ -22,16 +22,18 @@ import (
 
 const streamSharderTestTenant = "tenant"
 
-func newTestStreamSharder(ingestLimitsEnabled bool, pushRate float64, now time.Time) streamSharder {
-	d := &Distributor{
-		logger:       log.NewNopLogger(),
-		rateStore:    &fakeRateStore{pushRate: pushRate},
-		m:            newMetrics(prometheus.NewPedanticRegistry()),
-		shardTracker: NewShardTracker(),
+// newTestStreamSharder returns a sharder for streamSharderTestTenant with one-hour time shards.
+func newTestStreamSharder(rateStore RateStore, ingestLimitsEnabled bool, now time.Time) streamSharder {
+	return streamSharder{
+		rateStore:           rateStore,
+		shardTracker:        NewShardTracker(),
+		logger:              log.NewNopLogger(),
+		m:                   newMetrics(prometheus.NewPedanticRegistry()),
+		ingestLimitsEnabled: ingestLimitsEnabled,
+		timeShardLen:        time.Hour,
+		tenantID:            streamSharderTestTenant,
+		now:                 now,
 	}
-	d.cfg.IngestLimitsEnabled = ingestLimitsEnabled
-	d.ingesterCfg.MaxChunkAge = 2 * time.Hour
-	return newStreamSharder(d, streamSharderTestTenant, now, 1)
 }
 
 func newTestShardedStream(lbls labels.Labels, timestamps ...time.Time) logproto.InternalStreamAdapter {
@@ -123,7 +125,7 @@ func TestStreamSharder_ShardByRate(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStreamSharder(tc.ingestLimitsEnabled, tc.pushRate, now)
+			s := newTestStreamSharder(&fakeRateStore{pushRate: tc.pushRate}, tc.ingestLimitsEnabled, now)
 			stream := newTestShardedStream(lbls, now, now, now, now)
 
 			s.shard(stream, lbls, 400, "policy", tc.cfg)
@@ -144,7 +146,7 @@ func TestStreamSharder_ShardByRate(t *testing.T) {
 			if len(s.streams) > 1 {
 				wantLastShard = len(s.streams)
 			}
-			require.Equal(t, wantLastShard, s.d.shardTracker.LastShardNum(streamSharderTestTenant, stream.Hash))
+			require.Equal(t, wantLastShard, s.shardTracker.LastShardNum(streamSharderTestTenant, stream.Hash))
 		})
 	}
 }
@@ -152,7 +154,7 @@ func TestStreamSharder_ShardByRate(t *testing.T) {
 func TestStreamSharder_TimeSharding(t *testing.T) {
 	now := time.Now()
 	lbls := labels.FromStrings("app", "a")
-	// MaxChunkAge/2 is one hour, so these entries fall into two time shards.
+	// Time shards are one hour wide, so these entries fall into two of them.
 	old := now.Add(-5 * time.Hour).Truncate(time.Hour)
 	timeShardingCfg := func(mode string) shardstreams.Config {
 		return shardstreams.Config{
@@ -165,7 +167,7 @@ func TestStreamSharder_TimeSharding(t *testing.T) {
 	}
 
 	t.Run("old entries are time-sharded", func(t *testing.T) {
-		s := newTestStreamSharder(false, 0, now)
+		s := newTestStreamSharder(&fakeRateStore{}, false, now)
 		s.shard(newTestShardedStream(lbls, old, old.Add(90*time.Minute)), lbls, 8, "policy", timeShardingCfg(""))
 
 		require.Len(t, s.streams, 2)
@@ -177,7 +179,7 @@ func TestStreamSharder_TimeSharding(t *testing.T) {
 	})
 
 	t.Run("live-mode candidates are time shards", func(t *testing.T) {
-		s := newTestStreamSharder(true, 0, now)
+		s := newTestStreamSharder(&fakeRateStore{}, true, now)
 		s.shard(newTestShardedStream(lbls, old, old.Add(90*time.Minute)), lbls, 8, "policy", timeShardingCfg(shardstreams.LimitsServiceStreamShardingModeLive))
 
 		require.Empty(t, s.streams)
@@ -189,14 +191,14 @@ func TestStreamSharder_TimeSharding(t *testing.T) {
 
 	t.Run("backfill streams are not time-sharded", func(t *testing.T) {
 		backfill := labels.FromStrings("app", "a", constants.BackfillLabel, "true")
-		s := newTestStreamSharder(false, 0, now)
+		s := newTestStreamSharder(&fakeRateStore{}, false, now)
 		s.shard(newTestShardedStream(backfill, old, old.Add(90*time.Minute)), backfill, 8, "policy", timeShardingCfg(""))
 
 		require.Equal(t, []string{backfill.String()}, streamLabels(t, s.streams))
 	})
 
 	t.Run("recent entries are sorted in place but not time-sharded", func(t *testing.T) {
-		s := newTestStreamSharder(false, 0, now)
+		s := newTestStreamSharder(&fakeRateStore{}, false, now)
 		stream := newTestShardedStream(lbls, now, now.Add(-time.Second))
 		s.shard(stream, lbls, 8, "policy", timeShardingCfg(""))
 
@@ -218,7 +220,7 @@ func TestStreamSharder_MixedShardStreams(t *testing.T) {
 	disabled := shardstreams.Config{DesiredRate: loki_flagext.ByteSize(100)}
 
 	for _, ingestLimitsEnabled := range []bool{true, false} {
-		s := newTestStreamSharder(ingestLimitsEnabled, 0, now)
+		s := newTestStreamSharder(&fakeRateStore{}, ingestLimitsEnabled, now)
 		s.shard(newTestShardedStream(lbls, now), lbls, 4, "on", enabled)
 		s.shard(newTestShardedStream(lbls, now), lbls, 4, "off", disabled)
 		s.shard(newTestShardedStream(lbls, now), lbls, 4, "off-too", disabled)

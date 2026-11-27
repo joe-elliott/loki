@@ -56,7 +56,6 @@ import (
 	"github.com/grafana/loki/v3/pkg/util"
 	"github.com/grafana/loki/v3/pkg/util/constants"
 	util_log "github.com/grafana/loki/v3/pkg/util/log"
-	lokiring "github.com/grafana/loki/v3/pkg/util/ring"
 	"github.com/grafana/loki/v3/pkg/validation"
 )
 
@@ -564,7 +563,7 @@ func (d *Distributor) pushWithResolver(ctx context.Context, req *logproto.Intern
 
 	// Sharding runs before the rate limit, so a push the rate limit rejects
 	// may still have advanced shard rotations and been counted as sharded.
-	sharded := d.shardStreams(tenantID, now, validated.streams)
+	sharder := d.shardStreams(tenantID, now, validated.streams)
 
 	// An admitted push keeps its tokens even if a later stage rejects it.
 	if err := d.enforceIngestionRateLimits(ctx, now, vCtx, validated.streams, format); err != nil {
@@ -573,7 +572,7 @@ func (d *Distributor) pushWithResolver(ctx context.Context, req *logproto.Intern
 
 	// These limits are checked after the ingestion rate limit as this
 	// is how it works in ingesters.
-	streams, limitsErr := d.enforceStreamLimits(ctx, tenantID, sharded, vCtx, streamResolver, format)
+	streams, limitsErr := d.enforceStreamLimits(ctx, tenantID, &sharder, vCtx, streamResolver, format)
 	if limitsErr != nil {
 		limitsErr = httpgrpc.Error(http.StatusTooManyRequests, limitsErr.Error())
 	}
@@ -844,25 +843,25 @@ func (d *Distributor) validateStreams(
 	return result, nil
 }
 
-// enforceStreamLimits applies the stream limit to the sharded streams and returns the streams to
+// enforceStreamLimits applies the stream limit to the streams of sharder and returns the streams to
 // write. Nothing is checked while the ingest limits are disabled. Rejected streams are reported as
 // discarded, and the returned error names one of them, preferring a live-mode rejection over an
 // EnforceLimits one. It is the only error returned: when the limits service fails, the limits fail
 // open.
 //
-// CheckLimitsAndShard checks the live-mode streams and decides their shard count, and they are
-// sharded here. Every other stream was sharded by shardStreams, before the rate limit, and is
+// CheckLimitsAndShard checks the live-mode candidates and decides their shard count, and sharder
+// shards them here. Every other stream was sharded by shardStreams, before the rate limit, and is
 // checked by EnforceLimits. Streams are sharded in two places only while EnforceLimits
 // (ExceedsLimits) and CheckLimitsAndShard are both in use.
 func (d *Distributor) enforceStreamLimits(
 	ctx context.Context,
 	tenantID string,
-	sharded shardedStreams,
+	sharder *streamSharder,
 	vCtx validationContext,
 	streamResolver push.StreamResolver,
 	format string,
 ) ([]KeyedStream, error) {
-	streams := sharded.streams
+	streams := sharder.streams
 	// Candidates are only collected while the ingest limits are enabled, see
 	// streamSharder.shardByRate.
 	if !d.cfg.IngestLimitsEnabled {
@@ -873,9 +872,9 @@ func (d *Distributor) enforceStreamLimits(
 		liveStreams  []KeyedStream
 		liveRejected []logproto.InternalStreamAdapter
 	)
-	if len(sharded.liveCandidates) > 0 {
-		shardCounts := d.limitsServiceShardCounts(ctx, tenantID, shardstreams.LimitsServiceStreamShardingModeLive, sharded.liveCandidates)
-		for i, c := range sharded.liveCandidates {
+	if len(sharder.liveCandidates) > 0 {
+		shardCounts := d.limitsServiceShardCounts(ctx, tenantID, shardstreams.LimitsServiceStreamShardingModeLive, sharder.liveCandidates)
+		for i, c := range sharder.liveCandidates {
 			count := shardCounts[i]
 			if count == 0 {
 				// No stream budget left. In dry-run mode the limits service
@@ -887,13 +886,13 @@ func (d *Distributor) enforceStreamLimits(
 				}
 				count = 1
 			}
-			liveStreams = append(liveStreams, d.shardStreamToCount(c.stream, c.labels, tenantID, c.policy, c.shardStreamsCfg, count)...)
+			liveStreams = append(liveStreams, sharder.shardStreamToCount(c.stream, c.labels, c.policy, c.shardStreamsCfg, count)...)
 		}
 	}
 
-	if len(sharded.shadowCandidates) > 0 {
+	if len(sharder.shadowCandidates) > 0 {
 		// Only compared: the local rate store already sharded these streams.
-		d.limitsServiceShardCounts(ctx, tenantID, shardstreams.LimitsServiceStreamShardingModeShadow, sharded.shadowCandidates)
+		d.limitsServiceShardCounts(ctx, tenantID, shardstreams.LimitsServiceStreamShardingModeShadow, sharder.shadowCandidates)
 	}
 
 	var limitsErr error
@@ -1447,65 +1446,6 @@ func shardingState(rateStoreShards, limitsShards int) string {
 	}
 }
 
-// shardStream shards (divides) the given stream into N smaller streams, where
-// N is the sharding size for the given stream. shardSteam returns the smaller
-// streams and their associated keys for hashing to ingesters, along with the
-// shard count shardCountFor recommended. That count is not necessarily the
-// number of streams returned, as shardNested limits the shards to the number
-// of entries.
-//
-// The number of shards is limited by the number of entries.
-func (d *Distributor) shardStream(stream logproto.InternalStreamAdapter, lbls labels.Labels, pushSize int, tenantID string, policy string, shardStreamsCfg shardstreams.Config) ([]KeyedStream, int) {
-	logger := log.With(util_log.WithUserID(tenantID, d.logger), "stream", stream.Labels)
-	shardCount := d.shardCountFor(logger, stream, pushSize, tenantID, shardStreamsCfg)
-	return d.shardStreamToCount(stream, lbls, tenantID, policy, shardStreamsCfg, shardCount), shardCount
-}
-
-// shardStreamToCount shards stream into shardCount smaller streams, whoever
-// decided that count, and returns them with their hash keys. The number of
-// streams returned is not necessarily shardCount, as shardNested limits the
-// shards to the number of entries.
-func (d *Distributor) shardStreamToCount(stream logproto.InternalStreamAdapter, lbls labels.Labels, tenantID string, policy string, shardStreamsCfg shardstreams.Config, shardCount int) []KeyedStream {
-	if shardCount <= 1 {
-		return []KeyedStream{{HashKey: lokiring.TokenFor(tenantID, stream.Labels), HashKeyNoShard: stream.Hash, Stream: stream, Policy: policy}}
-	}
-
-	d.m.streamShardCount.Inc()
-	if shardStreamsCfg.LoggingEnabled {
-		level.Info(log.With(util_log.WithUserID(tenantID, d.logger), "stream", stream.Labels)).Log("msg", "sharding request", "shard_count", shardCount)
-	}
-
-	return d.divideEntriesBetweenShards(tenantID, lbls, shardCount, shardStreamsCfg, stream, policy)
-}
-
-func (d *Distributor) divideEntriesBetweenShards(tenantID string, lbls labels.Labels, totalShards int, shardStreamsCfg shardstreams.Config, stream logproto.InternalStreamAdapter, policy string) []KeyedStream {
-	if totalShards <= 0 {
-		level.Error(d.logger).Log("msg", "attempt to create shard with zeroed total shards", "org_id", tenantID, "stream", stream.Labels, "entries_len", stream.EntryCount())
-		return nil
-	}
-
-	// Only nonempty shards advance the shard rotation.
-	startShard := d.shardTracker.LastShardNum(tenantID, stream.Hash)
-	shards := shardNested(stream, lbls, totalShards, startShard)
-
-	derivedStreams := make([]KeyedStream, 0, len(shards))
-	for i := range shards {
-		derivedStreams = append(derivedStreams, KeyedStream{
-			HashKey:        lokiring.TokenFor(tenantID, shards[i].Labels),
-			HashKeyNoShard: stream.Hash,
-			Stream:         shards[i],
-			Policy:         policy,
-		})
-
-		if shardStreamsCfg.LoggingEnabled {
-			level.Info(d.logger).Log("msg", "stream derived from sharding", "src-stream", stream.Labels, "derived-stream", shards[i].Labels)
-		}
-	}
-	d.shardTracker.SetLastShardNum(tenantID, stream.Hash, startShard+len(shards))
-
-	return derivedStreams
-}
-
 func (d *Distributor) truncateLines(vContext validationContext, stream logproto.InternalStreamAdapter) {
 	if !vContext.maxLineSizeTruncate {
 		return
@@ -1766,40 +1706,6 @@ func (d *Distributor) parseAndValidateStreamLabels(ctx context.Context, vContext
 
 	d.labelCache.Add(key, labelData{parsed.lbs, parsed.hash})
 	return parsed, "", nil
-}
-
-// shardCountFor returns the right number of shards to be used by the given stream.
-//
-// It first checks if the number of shards is present in the shard store. If it isn't it will calculate it
-// based on the rate stored in the rate store and will store the new evaluated number of shards.
-//
-// desiredRate is expected to be given in bytes.
-func (d *Distributor) shardCountFor(logger log.Logger, stream logproto.InternalStreamAdapter, pushSize int, tenantID string, streamShardcfg shardstreams.Config) int {
-	if streamShardcfg.DesiredRate.Val() <= 0 {
-		if streamShardcfg.LoggingEnabled {
-			level.Error(logger).Log("msg", "invalid desired rate", "desired_rate", streamShardcfg.DesiredRate.String())
-		}
-		return 1
-	}
-
-	rate, pushRate := d.rateStore.RateFor(tenantID, stream.Hash)
-	if pushRate == 0 {
-		// first push, don't shard until the rate is understood
-		return 1
-	}
-
-	if pushRate > 1 {
-		// High throughput. Let stream sharding do its job and
-		// don't attempt to amortize the push size over the
-		// real rate
-		pushRate = 1
-	}
-
-	n, capped := calculateShards(rate, int(float64(pushSize)*pushRate), streamShardcfg.DesiredRate.Val(), streamShardcfg.MaxShardCount)
-	if capped {
-		d.m.rateStoreMaxShardsLimited.WithLabelValues(tenantID).Inc()
-	}
-	return n
 }
 
 func calculateShards(rate int64, pushSize, desiredRate, maxShardCount int) (n int, capped bool) {

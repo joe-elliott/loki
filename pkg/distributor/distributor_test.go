@@ -1996,14 +1996,9 @@ func TestStreamShard(t *testing.T) {
 			validator, err := NewValidator(overrides, nil)
 			require.NoError(t, err)
 
-			d := Distributor{
-				rateStore:    &fakeRateStore{pushRate: 1},
-				validator:    validator,
-				m:            newMetrics(prometheus.NewPedanticRegistry()),
-				shardTracker: NewShardTracker(),
-			}
+			s := newTestStreamSharder(&fakeRateStore{pushRate: 1}, false, time.Now())
 
-			derivedStreams, shardCount := d.shardStream(*logproto.FromStream(baseStream), mustParseLabels(baseStream.Labels), tc.streamSize, "fake", "", d.validator.ShardStreams("fake"))
+			derivedStreams, shardCount := s.shardStream(*logproto.FromStream(baseStream), mustParseLabels(baseStream.Labels), tc.streamSize, "", validator.ShardStreams("fake"))
 			require.Len(t, derivedStreams, tc.wantDerivedStreamSize)
 			require.Equal(t, tc.wantShardCount, shardCount)
 
@@ -2046,14 +2041,9 @@ func TestStreamShardAcrossCalls(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("it generates 4 shards across 2 calls when calculated shards = 2 * entries per call", func(t *testing.T) {
-		d := Distributor{
-			rateStore:    &fakeRateStore{pushRate: 1},
-			validator:    validator,
-			m:            newMetrics(prometheus.NewPedanticRegistry()),
-			shardTracker: NewShardTracker(),
-		}
+		s := newTestStreamSharder(&fakeRateStore{pushRate: 1}, false, time.Now())
 
-		derivedStreams, _ := d.shardStream(*logproto.FromStream(baseStream), mustParseLabels(baseStream.Labels), streamRate, "fake", "", d.validator.ShardStreams("fake"))
+		derivedStreams, _ := s.shardStream(*logproto.FromStream(baseStream), mustParseLabels(baseStream.Labels), streamRate, "", validator.ShardStreams("fake"))
 		require.Len(t, derivedStreams, 2)
 
 		for i, s := range derivedStreams {
@@ -2064,7 +2054,7 @@ func TestStreamShardAcrossCalls(t *testing.T) {
 			require.Equal(t, lbls.Get(constants.StreamShardLabel), fmt.Sprint(i))
 		}
 
-		derivedStreams, _ = d.shardStream(*logproto.FromStream(baseStream), mustParseLabels(baseStream.Labels), streamRate, "fake", "", d.validator.ShardStreams("fake"))
+		derivedStreams, _ = s.shardStream(*logproto.FromStream(baseStream), mustParseLabels(baseStream.Labels), streamRate, "", validator.ShardStreams("fake"))
 		require.Len(t, derivedStreams, 2)
 
 		for i, s := range derivedStreams {
@@ -2109,55 +2099,48 @@ func BenchmarkShardStream(b *testing.B) {
 	validator, err := NewValidator(overrides, nil)
 	require.NoError(b, err)
 
-	distributorBuilder := func(shards int) *Distributor {
-		d := &Distributor{
-			validator:    validator,
-			m:            newMetrics(prometheus.NewPedanticRegistry()),
-			shardTracker: NewShardTracker(),
-			// streamSize is always zero, so number of shards will be dictated just by the rate returned from store.
-			rateStore: &fakeRateStore{rate: int64(desiredRate*shards - 1)},
-		}
-
-		return d
+	sharderBuilder := func(shards int) streamSharder {
+		// streamSize is always zero, so number of shards will be dictated just by the rate returned from store.
+		return newTestStreamSharder(&fakeRateStore{rate: int64(desiredRate*shards - 1)}, false, time.Now())
 	}
 
 	b.Run("high number of entries, low number of shards", func(b *testing.B) {
-		d := distributorBuilder(2)
+		s := sharderBuilder(2)
 		stream.Entries = allEntries
 
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
-			d.shardStream(*logproto.FromStream(stream), mustParseLabels(stream.Labels), 0, "fake", "", d.validator.ShardStreams("fake")) //nolint:errcheck
+			s.shardStream(*logproto.FromStream(stream), mustParseLabels(stream.Labels), 0, "", validator.ShardStreams("fake")) //nolint:errcheck
 		}
 	})
 
 	b.Run("low number of entries, low number of shards", func(b *testing.B) {
-		d := distributorBuilder(2)
+		s := sharderBuilder(2)
 		stream.Entries = nil
 
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
-			d.shardStream(*logproto.FromStream(stream), mustParseLabels(stream.Labels), 0, "fake", "", d.validator.ShardStreams("fake")) //nolint:errcheck
+			s.shardStream(*logproto.FromStream(stream), mustParseLabels(stream.Labels), 0, "", validator.ShardStreams("fake")) //nolint:errcheck
 		}
 	})
 
 	b.Run("high number of entries, high number of shards", func(b *testing.B) {
-		d := distributorBuilder(64)
+		s := sharderBuilder(64)
 		stream.Entries = allEntries
 
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
-			d.shardStream(*logproto.FromStream(stream), mustParseLabels(stream.Labels), 0, "fake", "", d.validator.ShardStreams("fake")) //nolint:errcheck
+			s.shardStream(*logproto.FromStream(stream), mustParseLabels(stream.Labels), 0, "", validator.ShardStreams("fake")) //nolint:errcheck
 		}
 	})
 
 	b.Run("low number of entries, high number of shards", func(b *testing.B) {
-		d := distributorBuilder(64)
+		s := sharderBuilder(64)
 		stream.Entries = nil
 
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
-			d.shardStream(*logproto.FromStream(stream), mustParseLabels(stream.Labels), 0, "fake", "", d.validator.ShardStreams("fake")) //nolint:errcheck
+			s.shardStream(*logproto.FromStream(stream), mustParseLabels(stream.Labels), 0, "", validator.ShardStreams("fake")) //nolint:errcheck
 		}
 	})
 }
@@ -2475,11 +2458,9 @@ func TestShardCountFor(t *testing.T) {
 			flagext.DefaultValues(limits)
 			limits.ShardStreams.DesiredRate = tc.desiredRate
 
-			d := &Distributor{
-				rateStore: &fakeRateStore{tc.rate, tc.pushRate},
-			}
+			s := newTestStreamSharder(&fakeRateStore{tc.rate, tc.pushRate}, false, time.Now())
 			nested := *logproto.FromStream(*tc.stream)
-			got := d.shardCountFor(util_log.Logger, nested, tc.pushSize, "fake", limits.ShardStreams)
+			got := s.shardCountFor(util_log.Logger, nested, tc.pushSize, limits.ShardStreams)
 			require.Equal(t, tc.wantShards, got)
 		})
 	}
